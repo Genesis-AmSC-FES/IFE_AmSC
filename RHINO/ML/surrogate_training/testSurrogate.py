@@ -13,7 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from trainSurrogate import SurrogateMLP, load_feature_arrays, sha256_file
+from dataset_tracking import sha256_file
+from trainSurrogate import SurrogateMLP, load_feature_arrays
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -262,8 +263,23 @@ def main() -> None:
         if args.mlflow_tracking_uri:
             mlflow.set_tracking_uri(args.mlflow_tracking_uri)
         with mlflow.start_run(run_id=run_id):
+            source_dataset = split_indices.get("mlflow_datasets", {}).get(
+                "source", {}
+            )
+            source_name = source_dataset.get("name", features_path.stem)
+            test_dataset = mlflow.data.from_pandas(
+                frame.iloc[test_idx],
+                source=features_path.as_uri(),
+                name=f"{source_name}-testing",
+            )
+            mlflow.log_input(test_dataset, context="testing")
             mlflow.log_metrics(mlflow_metrics(metrics))
-            mlflow.set_tag("evaluation_complete", "true")
+            mlflow.set_tags(
+                {
+                    "evaluation_complete": "true",
+                    "test_dataset_digest": test_dataset.digest,
+                }
+            )
             mlflow.log_artifact(outdir / "metrics.json", artifact_path="evaluation")
             mlflow.log_artifact(
                 outdir / "test_predictions.csv",

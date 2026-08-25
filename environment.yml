@@ -42,7 +42,7 @@ dependencies:
   # Packages installed from PyPI because they are unavailable or more
   # consistently supported there for the RHINO workflows on NERSC.
   - pip:
-      - adios2==2.11.0.1014
+      - adios2==2.12.1.1001
       - hpc-campaign==0.7.0
       - fastmcp
       - starlette

@@ -5,9 +5,14 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
+from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
 from typing import Any, Sequence
 
 import numpy as np
@@ -16,16 +21,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from dataset_tracking import (
+    log_mlflow_dataset_inputs,
+    resolve_dataset_manifest,
+    sha256_file,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 RHINO_ROOT = BASE_DIR.parents[1]
-DEFAULT_FEATURES = (
-    RHINO_ROOT
-    / "AI_ready_workflow"
-    / "3_feature_extraction"
-    / "outputs"
-    / "rhino_features.csv"
-)
 DEFAULT_FEATURE_SPEC = (
     RHINO_ROOT
     / "AI_ready_workflow"
@@ -41,6 +45,41 @@ KNOWN_METADATA_COLUMNS = [
     "simulation_time",
     "simulation_datetime",
 ]
+
+
+def git_metadata(repository: Path) -> dict[str, Any]:
+    """Return reproducibility metadata without making Git a hard dependency."""
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+        )
+        return {"commit": commit, "dirty": dirty}
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return {"commit": None, "dirty": None}
+
+
+def copy_provenance_file(source: Path | None, destination: Path) -> Path | None:
+    """Copy a small provenance file into the portable run bundle."""
+    if source is None or not source.is_file():
+        return None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return destination
 
 
 class SurrogateMLP(nn.Module):
@@ -136,15 +175,6 @@ def load_feature_arrays(
     input_count = len(input_columns)
     matrix = values.to_numpy(dtype=np.float32)
     return frame, matrix[:, :input_count], matrix[:, input_count:]
-
-
-def sha256_file(path: Path) -> str:
-    """Return a stable SHA-256 fingerprint for dataset provenance checks."""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def split_dataset(
@@ -259,8 +289,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--features",
         type=Path,
-        default=DEFAULT_FEATURES,
-        help=f"Feature-layer CSV (default: {DEFAULT_FEATURES}).",
+        required=True,
+        help="Immutable feature-layer CSV to use for this training run.",
     )
     parser.add_argument(
         "--feature-spec",
@@ -269,6 +299,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Feature JSON used for default model columns "
             f"(default: {DEFAULT_FEATURE_SPEC})."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-manifest",
+        type=Path,
+        help=(
+            "Feature-dataset provenance manifest. If omitted, use an adjacent "
+            "dataset_manifest.json or <features>.manifest.json when present."
         ),
     )
     parser.add_argument(
@@ -334,6 +372,8 @@ def train_and_save(
     output_columns: Sequence[str],
     features_path: Path,
     outdir: Path,
+    dataset_manifest_path: Path | None = None,
+    dataset_manifest: dict[str, Any] | None = None,
     mlflow_module: Any | None = None,
     active_run: Any | None = None,
 ) -> None:
@@ -384,10 +424,30 @@ def train_and_save(
         "input_columns": list(input_columns),
         "output_columns": list(output_columns),
         "seed": args.seed,
+        "dataset_manifest": (
+            str(dataset_manifest_path) if dataset_manifest_path is not None else None
+        ),
+        "dataset_manifest_sha256": (
+            sha256_file(dataset_manifest_path)
+            if dataset_manifest_path is not None
+            else None
+        ),
         "mlflow_run_id": active_run.info.run_id if active_run else None,
     }
 
     if mlflow_module is not None:
+        dataset_name = str(
+            (dataset_manifest or {}).get("dataset_name", features_path.stem)
+        )
+        split_indices["mlflow_datasets"] = log_mlflow_dataset_inputs(
+            mlflow_module,
+            frame,
+            features_path,
+            features_digest,
+            train_idx,
+            val_idx,
+            dataset_name,
+        )
         mlflow_module.log_params(
             {
                 "epochs": args.epochs,
@@ -410,6 +470,10 @@ def train_and_save(
         }
         if split_indices["feature_spec_sha256"]:
             tags["feature_spec_sha256"] = split_indices["feature_spec_sha256"]
+        if split_indices["dataset_manifest_sha256"]:
+            tags["dataset_manifest_sha256"] = split_indices[
+                "dataset_manifest_sha256"
+            ]
         mlflow_module.set_tags(tags)
 
     criterion = nn.MSELoss()
@@ -458,8 +522,20 @@ def train_and_save(
     checkpoint_path = outdir / "rhino_surrogate.pt"
     history_path = outdir / "training_history.csv"
     split_path = outdir / "split_indices.json"
+    input_example_path = outdir / "input_example.csv"
+    run_manifest_path = outdir / "run_manifest.json"
     torch.save(artifact, checkpoint_path)
     pd.DataFrame(history).to_csv(history_path, index=False)
+    frame[list(input_columns)].head(5).to_csv(input_example_path, index=False)
+
+    bundled_feature_spec = copy_provenance_file(
+        feature_spec_path if feature_spec_exists else None,
+        outdir / "provenance" / "feature_spec.json",
+    )
+    bundled_dataset_manifest = copy_provenance_file(
+        dataset_manifest_path,
+        outdir / "provenance" / "dataset_manifest.json",
+    )
 
     if mlflow_module is not None:
         from mlflow.models import infer_signature
@@ -490,6 +566,7 @@ def train_and_save(
             registered_model_name=registered_name,
             code_paths=[
                 str(Path(__file__).resolve()),
+                str(BASE_DIR / "dataset_tracking.py"),
                 str(BASE_DIR / "mlflow_model.py"),
             ],
             pip_requirements=[
@@ -514,11 +591,91 @@ def train_and_save(
         mlflow_module.log_artifact(history_path, artifact_path="training")
         if feature_spec_exists:
             mlflow_module.log_artifact(feature_spec_path, artifact_path="provenance")
+        if dataset_manifest_path is not None:
+            mlflow_module.log_artifact(
+                dataset_manifest_path,
+                artifact_path="provenance",
+            )
 
     with split_path.open("w", encoding="utf-8") as stream:
         json.dump(split_indices, stream, indent=2)
+
+    run_manifest = {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "training": {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "hidden_dim": args.hidden_dim,
+            "hidden_layers": args.hidden_layers,
+            "learning_rate": args.lr,
+            "seed": args.seed,
+            "train_rows": len(train_idx),
+            "validation_rows": len(val_idx),
+            "test_rows": len(test_idx),
+            "input_columns": list(input_columns),
+            "output_columns": list(output_columns),
+            "device": str(device),
+        },
+        "dataset": {
+            "features_file": str(features_path),
+            "features_sha256": features_digest,
+            "row_count": len(frame),
+            "feature_spec_sha256": split_indices["feature_spec_sha256"],
+            "dataset_manifest_sha256": split_indices[
+                "dataset_manifest_sha256"
+            ],
+        },
+        "source": {
+            "repository": str(RHINO_ROOT.parent),
+            "git": git_metadata(RHINO_ROOT.parent),
+            "command": sys.argv,
+        },
+        "runtime": {
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "torch": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+        },
+        "scheduler": {
+            key.lower(): os.environ[key]
+            for key in (
+                "SLURM_JOB_ID",
+                "SLURM_JOB_NAME",
+                "SLURM_CLUSTER_NAME",
+                "NERSC_HOST",
+            )
+            if key in os.environ
+        },
+        "artifacts": {
+            "model": checkpoint_path.name,
+            "model_sha256": sha256_file(checkpoint_path),
+            "training_history": history_path.name,
+            "training_history_sha256": sha256_file(history_path),
+            "splits": split_path.name,
+            "splits_sha256": sha256_file(split_path),
+            "input_example": input_example_path.name,
+            "feature_spec": (
+                str(bundled_feature_spec.relative_to(outdir))
+                if bundled_feature_spec is not None
+                else None
+            ),
+            "dataset_manifest": (
+                str(bundled_dataset_manifest.relative_to(outdir))
+                if bundled_dataset_manifest is not None
+                else None
+            ),
+        },
+    }
+    with run_manifest_path.open("w", encoding="utf-8") as stream:
+        json.dump(run_manifest, stream, indent=2)
+
     if mlflow_module is not None:
         mlflow_module.log_artifact(split_path, artifact_path="training")
+        mlflow_module.log_artifact(run_manifest_path, artifact_path="training")
+        mlflow_module.log_artifact(input_example_path, artifact_path="training")
 
     print(f"Training device: {device}")
     print(
@@ -529,6 +686,8 @@ def train_and_save(
     print(checkpoint_path)
     print(history_path)
     print(split_path)
+    print(run_manifest_path)
+    print(input_example_path)
     if active_run is not None:
         print(f"MLflow run: {active_run.info.run_id}")
         if split_indices.get("mlflow_model_uri"):
@@ -564,6 +723,17 @@ def main() -> None:
         input_columns,
         output_columns,
     )
+    dataset_manifest_path, dataset_manifest = resolve_dataset_manifest(
+        features_path,
+        args.dataset_manifest,
+    )
+    if dataset_manifest is not None:
+        expected_rows = dataset_manifest.get("rows")
+        if expected_rows is not None and expected_rows != len(frame):
+            raise ValueError(
+                f"Dataset manifest records {expected_rows} rows, but the feature "
+                f"CSV contains {len(frame)}"
+            )
 
     train_arguments = {
         "args": args,
@@ -574,6 +744,8 @@ def main() -> None:
         "output_columns": output_columns,
         "features_path": features_path,
         "outdir": outdir,
+        "dataset_manifest_path": dataset_manifest_path,
+        "dataset_manifest": dataset_manifest,
     }
     if not args.mlflow:
         train_and_save(**train_arguments)

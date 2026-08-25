@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-SHIM_DIR = Path(__file__).resolve().parents[1]
+SHIM_DIR = Path(__file__).resolve().parents[1] / "1_shim"
 sys.path.insert(0, str(SHIM_DIR))
 
 import laserWrite_multi  # noqa: E402
