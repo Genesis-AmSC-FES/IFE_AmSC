@@ -7,7 +7,7 @@ the feature specification requests them.
 
 Feature selection is declared in JSON. Python is responsible for validating the
 specification, executing its SQL and ADIOS readers, joining rows by campaign
-run, and writing the resulting CSV.
+run, and writing the resulting CSV plus a provenance manifest.
 
 ## Workflow
 
@@ -26,7 +26,7 @@ Read requested array values through the ADIOS campaign reader
 Outer-join values by archive, dataset ID, and run ID
     |
     v
-ML-ready feature table (.csv)
+Immutable, content-addressed feature dataset (.csv + manifest)
     |
     v
 Surrogate training and downstream analysis
@@ -93,8 +93,53 @@ messages.
 ### `build_features.py`
 
 Provides the command-line workflow, loads the JSON specification, validates
-input paths, builds the table, reports missing values, and writes CSV output.
-It has no user-specific campaign paths embedded in the source.
+input paths, builds the table, reports missing values, and persists the CSV and
+its provenance. It has no user-specific campaign paths embedded in the source.
+
+### `dataset_provenance.py`
+
+Writes a byte-stable CSV, computes its SHA-256 digest, and stores it under a
+directory named with the first 12 digest characters. The adjacent
+`dataset_manifest.json` records the full digest and
+source campaign index and hash, campaign archive selection, feature spec and
+hash, SQL queries and hashes, schema, columns, and row count. Re-running the
+feature layer with identical CSV content reuses the existing dataset version.
+
+## Dataset Storage
+
+The canonical dataset lives in the durable project storage shared by training
+jobs. Its location is fixed in `build_features.py`:
+
+```text
+/global/cfs/cdirs/m3239/2026_FES-AmSC/data/rhino/ml-datasets
+```
+
+Each distinct feature table is stored as:
+
+```text
+/global/cfs/cdirs/m3239/2026_FES-AmSC/data/rhino/ml-datasets/<12-char-sha256>/
+├── rhino_features.csv
+└── dataset_manifest.json
+```
+
+The shortened SHA-256 directory makes dataset versions immutable and allows
+identical runs to reuse a version instead of saving another copy. The complete
+64-character digest remains in the manifest, and the writer rejects the
+unlikely event of a 12-character prefix collision. MLflow records the dataset
+URI and digest; the CSV itself remains in shared dataset storage. Local storage
+is appropriate only for development or temporary staging.
+
+Run the feature layer without `--output` to use this versioned layout:
+
+```bash
+python RHINO/AI_ready_workflow/3_feature_extraction/build_features.py \
+  --acx /global/homes/b/bhowmic/campaign-store/IFE/rhino.acx \
+  --campaign-store /global/homes/b/bhowmic/campaign-store
+```
+
+`--output /path/to/features.csv` remains available as an explicitly
+replaceable export and writes `/path/to/features.manifest.json`; it should not
+be treated as the canonical immutable dataset.
 
 ### Campaign SQL queries
 
@@ -182,41 +227,37 @@ re-ingested before these columns contain the corrected per-run values.
 
 ## Usage
 
-Run from this directory:
+From the repository root, build all configured features with the current RHINO
+campaign:
 
 ```bash
-cd RHINO/AI_ready_workflow/3_feature_extraction
-```
-
-Build all configured features:
-
-```bash
-python build_features.py \
-  --acx /path/to/campaign-store/IFE/rhino.acx \
-  --campaign-store /path/to/campaign-store/IFE \
-  --output outputs/rhino_features.csv
+python RHINO/AI_ready_workflow/3_feature_extraction/build_features.py \
+  --acx /global/homes/b/bhowmic/campaign-store/IFE/rhino.acx \
+  --campaign-store /global/homes/b/bhowmic/campaign-store
 ```
 
 `--campaign-store` is the base directory used to resolve archive names stored
-inside the index. For example, if the index contains `rhino1.aca`, the command
-above reads `/path/to/campaign-store/IFE/rhino1.aca`.
+inside the index. The current index contains names such as `IFE/rhino1.aca`, so
+the campaign-store argument is the directory above `IFE`. The command above
+therefore reads
+`/global/homes/b/bhowmic/campaign-store/IFE/rhino1.aca`.
 
 Select only matching archives with a SQL `LIKE` pattern:
 
 ```bash
-python build_features.py \
-  --acx /path/to/rhino.acx \
-  --campaign-store /path/to/campaign-store/IFE \
-  --archive-name 'rhino1.aca' \
+python RHINO/AI_ready_workflow/3_feature_extraction/build_features.py \
+  --acx /global/homes/b/bhowmic/campaign-store/IFE/rhino.acx \
+  --campaign-store /global/homes/b/bhowmic/campaign-store \
+  --archive-name 'IFE/rhino1.aca' \
   --output outputs/rhino1_features.csv
 ```
 
 Use a different specification or query directory:
 
 ```bash
-python build_features.py \
-  --acx /path/to/rhino.acx \
-  --campaign-store /path/to/campaign-store/IFE \
+python RHINO/AI_ready_workflow/3_feature_extraction/build_features.py \
+  --acx /global/homes/b/bhowmic/campaign-store/IFE/rhino.acx \
+  --campaign-store /global/homes/b/bhowmic/campaign-store \
   --spec /path/to/feature_spec.json \
   --query-dir /path/to/queries \
   --output outputs/custom_features.csv
