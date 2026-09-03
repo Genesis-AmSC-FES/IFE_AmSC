@@ -1,3 +1,4 @@
+
 # RHINO Surrogate Training
 
 This layer trains and evaluates a multi-output neural-network surrogate using
@@ -415,3 +416,76 @@ curl http://127.0.0.1:8080/invocations \
     }
   }'
 ```
+
+
+## DagsHub MLflow Tracking on NERSC
+
+RHINO jobs can stream training progress, provenance, models, and evaluation
+artifacts to the shared DagsHub MLflow service while NERSC remains the source
+of truth for the feature CSV and job-local run bundle. The CSV is referenced by
+its path, manifest, and SHA-256 digest; it is not uploaded on every run.
+
+### Configure a Jupyter terminal
+
+Create a DagsHub access token, then configure the terminal that submits Slurm
+jobs:
+
+```bash
+export MLFLOW_TRACKING_URI="https://dagshub.com/cbhowmic/rhino-mlflow.mlflow"
+export MLFLOW_TRACKING_USERNAME="<your-dagshub-username>"
+export MLFLOW_TRACKING_PASSWORD="<your-dagshub-token>"
+export MLFLOW_EXPERIMENT="rhino-surrogate"
+```
+
+Never commit the token or place it in a Slurm script. These values apply to the
+current shell. `sbatch --export=ALL` passes them to the compute allocation
+without writing credentials into the repository.
+
+### Submit a live-tracked job
+
+When `MLFLOW_TRACKING_URI` is set, `train_nersc.slurm` enables tracking,
+requires the adjacent `dataset_manifest.json`, and gives the run the default
+name `perlmutter-<Slurm job id>`.
+
+```bash
+cd /global/homes/b/bhowmic/Projects/IFE_AmSC
+sbatch --export=ALL,FEATURES=/global/homes/b/bhowmic/Projects/IFE_AmSC/RHINO/AI_ready_workflow/3_feature_extraction/outputs/rhino_features.csv \
+  RHINO/ML/surrogate_training/train_nersc.slurm
+```
+
+For a short end-to-end check, override the epoch count:
+
+```bash
+sbatch --export=ALL,EPOCHS=10,FEATURES=/global/homes/b/bhowmic/Projects/IFE_AmSC/RHINO/AI_ready_workflow/3_feature_extraction/outputs/rhino_features.csv \
+  RHINO/ML/surrogate_training/train_nersc.slurm
+```
+
+Runs appear in [DagsHub MLflow](https://dagshub.com/cbhowmic/rhino-mlflow/experiments) after they start. Refresh the experiment page or clear filters if
+a new run is not immediately visible.
+
+### Live metrics and artifacts
+
+`trainSurrogate.py` logs the experiment configuration, Git and dataset
+provenance, model signature, model artifact, checkpoint, and per-epoch metrics:
+
+- `train_loss` and `val_loss`: normalized-target mean squared error.
+- `train_r2` and `val_r2`: variance-weighted R-squared across surrogate outputs.
+
+This is multi-output regression, so classification-style percentage accuracy is
+not meaningful. R-squared is the appropriate accuracy-like measure: `1.0` is
+perfect, `0.0` equals a mean-value baseline, and negative values are worse
+than that baseline. A domain-specific "within tolerance" percentage can be
+added later once physical tolerances are chosen for each output.
+
+`testSurrogate.py` reopens the same MLflow run after training and logs final
+test metrics, predictions, `metrics.json`, and parity plots. The matching
+NERSC bundle is stored at `$PSCRATCH/rhino-runs/<Slurm job id>`.
+
+### Data split interpretation
+
+The seeded split is 80% training, 15% validation, and 5% held-out test data.
+Training loss updates the model weights. Validation loss/R-squared are measured
+each epoch on unseen validation data and the checkpoint with lowest validation
+loss is retained. Test metrics are computed once after model selection on the
+separate held-out samples, making them the final unbiased estimate. Validation
+loss is therefore not the same as test loss.

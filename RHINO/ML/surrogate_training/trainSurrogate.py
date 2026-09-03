@@ -281,6 +281,29 @@ def run_epoch(
     return total_loss / total_samples
 
 
+
+def evaluate_r2(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str | torch.device = "cpu",
+) -> float:
+    """Return variance-weighted R-squared across continuous surrogate outputs."""
+    model.eval()
+    predictions: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for xb, yb in loader:
+            prediction = model(xb.to(device)).cpu().numpy()
+            predictions.append(prediction)
+            targets.append(yb.numpy())
+
+    y_pred = np.concatenate(predictions, axis=0)
+    y_true = np.concatenate(targets, axis=0)
+    residual_sum = np.square(y_true - y_pred).sum()
+    total_sum = np.square(y_true - y_true.mean(axis=0, keepdims=True)).sum()
+    return float("nan") if total_sum == 0 else float(1.0 - residual_sum / total_sum)
+
 def parse_args() -> argparse.Namespace:
     """Parse surrogate-training command-line options."""
     parser = argparse.ArgumentParser(
@@ -480,16 +503,26 @@ def train_and_save(
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     best_val_loss = float("inf")
     best_state = copy.deepcopy(model.state_dict())
-    history = {"train_loss": [], "val_loss": []}
+    history = {"train_loss": [], "val_loss": [], "train_r2": [], "val_r2": []}
+
 
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(model, train_loader, criterion, optimizer, device)
         val_loss = run_epoch(model, val_loader, criterion, device=device)
+        train_r2 = evaluate_r2(model, train_loader, device)
+        val_r2 = evaluate_r2(model, val_loader, device)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["train_r2"].append(train_r2)
+        history["val_r2"].append(val_r2)
         if mlflow_module is not None:
             mlflow_module.log_metrics(
-                {"train_loss": train_loss, "val_loss": val_loss},
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_r2": train_r2,
+                    "val_r2": val_r2,
+                },
                 step=epoch,
             )
 
@@ -499,7 +532,8 @@ def train_and_save(
         if epoch % 20 == 0:
             print(
                 f"Epoch {epoch:4d} | train_loss={train_loss:.6e} | "
-                f"val_loss={val_loss:.6e}"
+                f"val_loss={val_loss:.6e} | train_r2={train_r2:.4f} | "
+                f"val_r2={val_r2:.4f}"
             )
 
     model.load_state_dict(best_state)

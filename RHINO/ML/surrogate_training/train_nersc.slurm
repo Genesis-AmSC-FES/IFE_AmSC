@@ -27,6 +27,31 @@ RUN_DIR="${RUN_ROOT}/${SLURM_JOB_ID}"
 mkdir -p "${RUN_DIR}"
 cd "${REPOSITORY}"
 
+TRAIN_MLFLOW_ARGS=()
+TEST_MLFLOW_ARGS=()
+if [[ -n "${MLFLOW_TRACKING_URI:-}" ]]; then
+    DATASET_MANIFEST="${DATASET_MANIFEST:-$(dirname "${FEATURES}")/dataset_manifest.json}"
+    if [[ ! -f "${DATASET_MANIFEST}" ]]; then
+        echo "Dataset manifest not found: ${DATASET_MANIFEST}" >&2
+        exit 2
+    fi
+
+    MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-rhino-surrogate}"
+    MLFLOW_RUN_NAME="${MLFLOW_RUN_NAME:-perlmutter-${SLURM_JOB_ID}}"
+    TRAIN_MLFLOW_ARGS=(
+        --mlflow
+        --mlflow-tracking-uri "${MLFLOW_TRACKING_URI}"
+        --mlflow-experiment "${MLFLOW_EXPERIMENT}"
+        --mlflow-run-name "${MLFLOW_RUN_NAME}"
+        --dataset-manifest "${DATASET_MANIFEST}"
+        --skip-model-registration
+    )
+    TEST_MLFLOW_ARGS=(
+        --mlflow
+        --mlflow-tracking-uri "${MLFLOW_TRACKING_URI}"
+    )
+fi
+
 srun python RHINO/ML/surrogate_training/trainSurrogate.py \
     --features "${FEATURES}" \
     --outdir "${RUN_DIR}" \
@@ -35,11 +60,13 @@ srun python RHINO/ML/surrogate_training/trainSurrogate.py \
     --hidden-dim "${HIDDEN_DIM:-100}" \
     --hidden-layers "${HIDDEN_LAYERS:-3}" \
     --lr "${LEARNING_RATE:-1e-4}" \
-    --seed "${SEED:-42}"
+    --seed "${SEED:-42}" \
+    "${TRAIN_MLFLOW_ARGS[@]}"
 
 srun python RHINO/ML/surrogate_training/testSurrogate.py \
     --model "${RUN_DIR}/rhino_surrogate.pt" \
     --splits "${RUN_DIR}/split_indices.json" \
-    --outdir "${RUN_DIR}"
+    --outdir "${RUN_DIR}" \
+    "${TEST_MLFLOW_ARGS[@]}"
 
 echo "Portable run bundle: ${RUN_DIR}"
