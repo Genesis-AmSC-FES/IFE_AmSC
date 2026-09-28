@@ -53,10 +53,6 @@ if [[ ! -d "$RHINO_DATA_ROOT" ]]; then
     echo "ERROR: RHINO data root does not exist: $RHINO_DATA_ROOT" >&2
     exit 1
 fi
-if (( DATASETS_PER_ARCHIVE <= 0 )); then
-    echo "ERROR: DATASETS_PER_ARCHIVE must be greater than zero." >&2
-    exit 1
-fi
 if (( ${#INPUT_DIRS[@]} == 0 )); then
     echo "ERROR: INPUT_DIRS must contain at least one directory." >&2
     exit 1
@@ -72,7 +68,6 @@ echo "--------------------------------------------------"
 echo "Data root          : $RHINO_DATA_ROOT"
 echo "Campaign store     : $CAMPAIGN_STORE"
 echo "Archive prefix     : $ARCHIVE_PREFIX"
-echo "Datasets/archive   : $DATASETS_PER_ARCHIVE"
 echo "TAR output         : $TAR_OUTPUT_DIR"
 echo "TAR prefix         : $TAR_PREFIX"
 echo "TAR storage        : $TAR_STORAGE_SYSTEM / $TAR_STORAGE_HOST"
@@ -111,8 +106,11 @@ if (( ${#files[@]} == 0 )); then
 fi
 
 mapfile -t files < <(printf '%s\n' "${files[@]}" | sort)
-estimated_archives=$(( (${#files[@]} + DATASETS_PER_ARCHIVE - 1) / DATASETS_PER_ARCHIVE ))
-
+declare -A dated_input_dirs
+for dataset in "${files[@]}"; do
+    dated_input_dirs["$(dirname "$dataset")"]=1
+done
+estimated_archives=${#dated_input_dirs[@]}
 echo "Discovered ${#files[@]} dataset(s)."
 echo "Estimated archive count: $estimated_archives"
 
@@ -175,14 +173,13 @@ for input_dir in "${INPUT_DIRS[@]}"; do
     fi
 done
 
-declare -A archive_tar_pairs
+declare -A archive_started
 
-# Add live BP5 datasets. Relative paths intentionally match the TAR members.
-for dataset_number in "${!files[@]}"; do
-    dataset="${files[$dataset_number]}"
-    archive_number=$(( dataset_number / DATASETS_PER_ARCHIVE + 1 ))
-    position=$(( dataset_number % DATASETS_PER_ARCHIVE ))
-    archive="${ARCHIVE_PREFIX}${archive_number}.aca"
+# Add live BP5 datasets to one dated campaign archive per input directory.
+for dataset in "${files[@]}"; do
+    input_dir=$(dirname "$dataset")
+    date_name=$(basename "$input_dir")
+    archive="${ARCHIVE_PREFIX}-${date_name}.aca"
     name=$(basename "$dataset" .bp5)
     run_id=$(grep -oP '\d{2}-\d{2}-\d{2}.*' <<< "$name" || true)
     if [[ -z "$run_id" ]]; then
@@ -200,40 +197,37 @@ for dataset_number in "${!files[@]}"; do
         --campaign_store "$CAMPAIGN_STORE"
         "$archive"
     )
-    if (( position == 0 )); then
+    if [[ -z "${archive_started[$archive]:-}" ]]; then
         command+=(--truncate)
+        archive_started["$archive"]=1
     fi
     command+=(data "$dataset" --name "$run_id")
     run_cmd "${command[@]}"
-
-    input_dir=$(dirname "$dataset")
-    archive_tar_pairs["$archive|$input_dir"]=1
 done
 
 # Supplying the TAR index makes hpc_campaign attach every matching BP5 replica.
-for (( archive_number = 1; archive_number <= estimated_archives; archive_number++ )); do
-    archive="${ARCHIVE_PREFIX}${archive_number}.aca"
-    for input_dir in "${INPUT_DIRS[@]}"; do
-        if [[ -z "${archive_tar_pairs[$archive|$input_dir]:-}" ]]; then
-            continue
-        fi
-        tar_path="${tar_by_dir[$input_dir]}"
-        tar_index_path="${tar_path}.idx"
+for input_dir in "${INPUT_DIRS[@]}"; do
+    date_name=$(basename "$input_dir")
+    archive="${ARCHIVE_PREFIX}-${date_name}.aca"
+    if [[ -z "${archive_started[$archive]:-}" ]]; then
+        continue
+    fi
+    tar_path="${tar_by_dir[$input_dir]}"
+    tar_index_path="${tar_path}.idx"
 
-        echo
-        echo "Registering TAR replicas:"
-        echo "  Archive : $archive"
-        echo "  TAR     : $tar_path"
-        run_cmd hpc_campaign manager \
-            --campaign_store "$CAMPAIGN_STORE" \
-            "$archive" \
-            add-archival-storage \
-            "$TAR_STORAGE_SYSTEM" \
-            "$TAR_STORAGE_HOST" \
-            "$TAR_OUTPUT_DIR" \
-            "$(basename "$tar_path")" \
-            "$tar_index_path"
-    done
+    echo
+    echo "Registering TAR replicas:"
+    echo "  Archive : $archive"
+    echo "  TAR     : $tar_path"
+    run_cmd hpc_campaign manager \
+        --campaign_store "$CAMPAIGN_STORE" \
+        "$archive" \
+        add-archival-storage \
+        "$TAR_STORAGE_SYSTEM" \
+        "$TAR_STORAGE_HOST" \
+        "$TAR_OUTPUT_DIR" \
+        "$(basename "$tar_path")" \
+        "$tar_index_path"
 done
 
 echo
@@ -241,5 +235,5 @@ echo "--------------------------------------------------"
 echo "Campaign archive creation complete."
 echo "Campaign archives : $estimated_archives"
 echo "TAR files         : ${#INPUT_DIRS[@]}"
-echo "Datasets/archive  : up to $DATASETS_PER_ARCHIVE"
+echo "Grouping          : one campaign archive per date"
 echo "--------------------------------------------------"

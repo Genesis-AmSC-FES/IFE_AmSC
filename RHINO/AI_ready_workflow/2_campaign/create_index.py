@@ -19,7 +19,7 @@ def load_spec(path: Path) -> dict[str, Any]:
         spec = json.load(stream)
 
     required = {
-        "CAMPAIGN_STORE": str,
+        "PUBLISH_CAMPAIGN_STORE": str,
         "ARCHIVE_PREFIX": str,
         "CAMPAIGN_INDEX": str,
     }
@@ -36,8 +36,8 @@ def load_spec(path: Path) -> dict[str, Any]:
 
 
 def create_index(spec: dict[str, Any], *, dry_run: bool = False) -> None:
-    """Build a campaign index from the configured campaign archives."""
-    campaign_store = Path(spec["CAMPAIGN_STORE"]).expanduser()
+    """Build the authoritative index from published campaign archives."""
+    campaign_store = Path(spec["PUBLISH_CAMPAIGN_STORE"]).expanduser()
     archive_prefix = spec["ARCHIVE_PREFIX"]
     configured_index = Path(spec["CAMPAIGN_INDEX"])
 
@@ -67,7 +67,7 @@ def create_index(spec: dict[str, Any], *, dry_run: bool = False) -> None:
         else str(index_path)
     )
 
-    print(f"Campaign store: {campaign_store}")
+    print(f"Published campaign store: {campaign_store}")
     print(f"Index: {index_path}")
     print(f"Found {len(archives)} archive(s):")
     for archive in archives:

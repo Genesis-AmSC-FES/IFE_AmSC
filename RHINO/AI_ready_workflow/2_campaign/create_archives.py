@@ -8,7 +8,7 @@ import json
 import re
 import shlex
 import subprocess
-from collections import defaultdict
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +28,6 @@ def load_spec(path: Path) -> dict[str, Any]:
         "CAMPAIGN_STORE": str,
         "CAMPAIGN_NAMESPACE": str,
         "ARCHIVE_PREFIX": str,
-        "DATASETS_PER_ARCHIVE": int,
         "INPUT_DIRS": list,
         "TAR_OUTPUT_DIR": str,
         "TAR_PREFIX": str,
@@ -44,10 +43,6 @@ def load_spec(path: Path) -> dict[str, Any]:
                 f"not {type(spec[key]).__name__}"
             )
 
-    if isinstance(spec["DATASETS_PER_ARCHIVE"], bool):
-        raise TypeError("Setting 'DATASETS_PER_ARCHIVE' must be int, not bool")
-    if spec["DATASETS_PER_ARCHIVE"] <= 0:
-        raise ValueError("DATASETS_PER_ARCHIVE must be greater than zero")
     if not spec["INPUT_DIRS"]:
         raise ValueError("INPUT_DIRS must contain at least one directory")
     if not all(isinstance(item, str) and item for item in spec["INPUT_DIRS"]):
@@ -162,24 +157,67 @@ def tar_path_for_directory(
     return tar_output_dir / f"{tar_prefix}-{input_directory.name}.tar"
 
 
+def validate_tar_members(
+    tar_path: Path, datasets: list[Path], data_root: Path
+) -> None:
+    """Ensure an existing TAR contains only the datasets assigned to its ACA."""
+    expected = {
+        str(dataset.relative_to(data_root)).rstrip("/") for dataset in datasets
+    }
+    found: set[str] = set()
+
+    with tarfile.open(tar_path, "r") as archive:
+        for member in archive:
+            member_name = member.name.removeprefix("./").rstrip("/")
+            matching_dataset = next(
+                (
+                    dataset
+                    for dataset in expected
+                    if member_name == dataset
+                    or member_name.startswith(f"{dataset}/")
+                ),
+                None,
+            )
+            if matching_dataset is None:
+                raise ValueError(
+                    f"Existing TAR contains a path not present in its ACA: "
+                    f"{member.name}. Use --rebuild-tars to replace {tar_path}."
+                )
+            found.add(matching_dataset)
+
+    missing = expected - found
+    if missing:
+        missing_list = ", ".join(sorted(missing))
+        raise ValueError(
+            f"Existing TAR is missing ACA datasets: {missing_list}. "
+            f"Use --rebuild-tars to replace {tar_path}."
+        )
+
+
 def create_tar_archives(
     *,
+    archive_datasets: dict[str, list[Path]],
     data_root: Path,
-    input_directories: list[Path],
     tar_output_dir: Path,
     tar_prefix: str,
     rebuild_tars: bool,
     dry_run: bool,
-) -> dict[Path, Path]:
-    """Create, verify, and index one TAR for each BP5 input directory."""
-    tar_paths: dict[Path, Path] = {}
+) -> dict[str, Path]:
+    """Create, verify, and index one TAR from each ACA's dataset list."""
+    tar_paths: dict[str, Path] = {}
     seen_paths: set[Path] = set()
 
     if not dry_run:
         tar_output_dir.mkdir(parents=True, exist_ok=True)
 
-    for input_directory in input_directories:
-        relative_directory = input_directory.relative_to(data_root)
+    for archive, datasets in archive_datasets.items():
+        dataset_directories = {dataset.parent for dataset in datasets}
+        if len(dataset_directories) != 1:
+            raise ValueError(
+                f"Campaign archive {archive} spans multiple date directories"
+            )
+        input_directory = next(iter(dataset_directories))
+        relative_datasets = [dataset.relative_to(data_root) for dataset in datasets]
         tar_path = tar_path_for_directory(
             input_directory, tar_output_dir, tar_prefix
         )
@@ -188,21 +226,27 @@ def create_tar_archives(
 
         if tar_path in seen_paths:
             raise ValueError(
-                f"Multiple INPUT_DIRS produce the same TAR name: {tar_path}"
+                f"Multiple campaign archives produce the same TAR name: {tar_path}"
             )
         seen_paths.add(tar_path)
-        tar_paths[input_directory] = tar_path
+        tar_paths[archive] = tar_path
         if tar_output_dir.is_relative_to(input_directory):
             raise ValueError(
                 f"TAR_OUTPUT_DIR cannot be inside a directory being archived: "
                 f"{input_directory}"
             )
 
-        print(f"\nPreparing TAR for {relative_directory}:")
+        print(f"\nPreparing TAR for {archive}:")
+        print(f"  Datasets: {len(relative_datasets)}")
         create_tar = rebuild_tars or not tar_path.exists()
         if create_tar:
             run_command(
-                ["tar", "-cf", str(tar_path), str(relative_directory)],
+                [
+                    "tar",
+                    "-cf",
+                    str(tar_path),
+                    *(str(dataset) for dataset in relative_datasets),
+                ],
                 cwd=data_root,
                 dry_run=dry_run,
             )
@@ -220,7 +264,9 @@ def create_tar_archives(
                 print(f"  Verify   : {checksum_path}")
             else:
                 verify_checksum(tar_path)
+                validate_tar_members(tar_path, datasets, data_root)
                 print(f"  Verified : {checksum_path}")
+                print("  Contents : match ACA dataset list")
 
         index_is_stale = (
             tar_path.exists()
@@ -238,104 +284,90 @@ def create_tar_archives(
 
     return tar_paths
 
-
-def archive_name_for_dataset(
-    dataset_number: int, archive_prefix: str, archive_size: int
+def archive_name_for_directory(
+    input_directory: Path, archive_prefix: str
 ) -> str:
-    """Return the campaign archive name for a zero-based dataset position."""
-    archive_number = dataset_number // archive_size + 1
-    return f"{archive_prefix}{archive_number}.aca"
+    """Return the dated campaign archive name for one input directory."""
+    return f"{archive_prefix}-{input_directory.name}.aca"
 
 
 def create_campaign_archives(
     *,
     datasets: list[Path],
+    input_directories: list[Path],
     data_root: Path,
     campaign_store: Path,
     archive_prefix: str,
-    archive_size: int,
     dry_run: bool,
 ) -> dict[str, list[Path]]:
-    """Add live BP5 datasets to campaign archives and return their grouping."""
-    archive_datasets: dict[str, list[Path]] = defaultdict(list)
+    """Create one campaign archive for each dated input directory."""
+    archive_datasets: dict[str, list[Path]] = {}
 
-    for dataset_number, dataset in enumerate(datasets):
-        archive = archive_name_for_dataset(
-            dataset_number, archive_prefix, archive_size
-        )
-        position = dataset_number % archive_size
-        relative_dataset = dataset.relative_to(data_root)
-        run_id = run_id_from_path(dataset)
-        archive_datasets[archive].append(dataset)
-
-        print("\nAdding dataset:")
-        print(f"  File    : {relative_dataset}")
-        print(f"  Run ID  : {run_id}")
-        print(f"  Archive : {archive}")
-
-        command = [
-            "hpc_campaign",
-            "manager",
-            "--campaign_store",
-            str(campaign_store),
-            archive,
+    for input_directory in input_directories:
+        archive = archive_name_for_directory(input_directory, archive_prefix)
+        dated_datasets = [
+            dataset for dataset in datasets if dataset.parent == input_directory
         ]
-        if position == 0:
-            command.append("--truncate")
-        command.extend(["data", str(relative_dataset), "--name", run_id])
-        run_command(command, cwd=data_root, dry_run=dry_run)
+        if not dated_datasets:
+            print(f"\nSkipping empty date directory: {input_directory}")
+            continue
+        archive_datasets[archive] = dated_datasets
 
-    return dict(archive_datasets)
+        for dataset_number, dataset in enumerate(dated_datasets):
+            relative_dataset = dataset.relative_to(data_root)
+            run_id = run_id_from_path(dataset)
 
-
-def register_tar_replicas(
-    *,
-    archive_datasets: dict[str, list[Path]],
-    input_directories: list[Path],
-    tar_paths: dict[Path, Path],
-    data_root: Path,
-    campaign_store: Path,
-    storage_system: str,
-    storage_host: str,
-    dry_run: bool,
-) -> None:
-    """Register only the TAR files containing datasets in each campaign archive."""
-    dataset_directories = {
-        dataset: next(
-            directory
-            for directory in input_directories
-            if dataset.parent == directory
-        )
-        for datasets in archive_datasets.values()
-        for dataset in datasets
-    }
-
-    for archive, datasets in archive_datasets.items():
-        relevant_directories = sorted(
-            {dataset_directories[dataset] for dataset in datasets},
-            key=str,
-        )
-        for input_directory in relevant_directories:
-            tar_path = tar_paths[input_directory]
-            index_path = tar_path.with_name(f"{tar_path.name}.idx")
-            print("\nRegistering TAR replicas:")
+            print("\nAdding dataset:")
+            print(f"  File    : {relative_dataset}")
+            print(f"  Run ID  : {run_id}")
             print(f"  Archive : {archive}")
-            print(f"  TAR     : {tar_path}")
+
             command = [
                 "hpc_campaign",
                 "manager",
                 "--campaign_store",
                 str(campaign_store),
                 archive,
-                "add-archival-storage",
-                storage_system,
-                storage_host,
-                str(tar_path.parent),
-                tar_path.name,
-                str(index_path),
             ]
+            if dataset_number == 0:
+                command.append("--truncate")
+            command.extend(["data", str(relative_dataset), "--name", run_id])
             run_command(command, cwd=data_root, dry_run=dry_run)
 
+    return archive_datasets
+
+
+def register_tar_replicas(
+    *,
+    archive_datasets: dict[str, list[Path]],
+    tar_paths: dict[str, Path],
+    data_root: Path,
+    campaign_store: Path,
+    storage_system: str,
+    storage_host: str,
+    dry_run: bool,
+) -> None:
+    """Register the one NERSC TAR copy associated with each campaign archive."""
+    for archive in archive_datasets:
+        tar_path = tar_paths[archive]
+        index_path = tar_path.with_name(f"{tar_path.name}.idx")
+        print("\nRegistering NERSC TAR replicas:")
+        print(f"  Archive : {archive}")
+        print(f"  TAR     : {tar_path}")
+        command = [
+            "hpc_campaign",
+            "manager",
+            "--campaign_store",
+            str(campaign_store),
+            archive,
+            "add-archival-storage",
+            storage_system,
+            storage_host,
+            str(tar_path.parent),
+            tar_path.name,
+            str(index_path),
+        ]
+        run_command(command, cwd=data_root, dry_run=dry_run)
 
 def create_archives(
     spec: dict[str, Any],
@@ -343,11 +375,10 @@ def create_archives(
     dry_run: bool = False,
     rebuild_tars: bool = False,
 ) -> None:
-    """Create TARs, campaign archives, and TAR-backed dataset replicas."""
+    """Create date-based ACAs, matching TARs, and NERSC TAR replicas."""
     data_root = Path(spec["RHINO_DATA_ROOT"]).expanduser().resolve()
     campaign_store = Path(spec["CAMPAIGN_STORE"]).expanduser()
     archive_prefix = spec["ARCHIVE_PREFIX"]
-    archive_size = spec["DATASETS_PER_ARCHIVE"]
 
     if not data_root.is_dir():
         raise FileNotFoundError(f"RHINO data root does not exist: {data_root}")
@@ -358,32 +389,31 @@ def create_archives(
     if not datasets:
         raise FileNotFoundError("No .bp5 datasets were discovered")
 
-    archive_count = (len(datasets) + archive_size - 1) // archive_size
     print(f"Discovered {len(datasets)} dataset(s).")
-    print(f"Estimated archive count: {archive_count}")
+    archive_datasets = create_campaign_archives(
+        datasets=datasets,
+        input_directories=input_directories,
+        data_root=data_root,
+        campaign_store=campaign_store,
+        archive_prefix=archive_prefix,
+        dry_run=dry_run,
+    )
+    archive_count = len(archive_datasets)
+    print(f"Dated archive count: {archive_count}")
 
     tar_output_dir = resolve_from_root(
         data_root, spec["TAR_OUTPUT_DIR"]
     ).resolve()
     tar_paths = create_tar_archives(
+        archive_datasets=archive_datasets,
         data_root=data_root,
-        input_directories=input_directories,
         tar_output_dir=tar_output_dir,
         tar_prefix=spec["TAR_PREFIX"],
         rebuild_tars=rebuild_tars,
         dry_run=dry_run,
     )
-    archive_datasets = create_campaign_archives(
-        datasets=datasets,
-        data_root=data_root,
-        campaign_store=campaign_store,
-        archive_prefix=archive_prefix,
-        archive_size=archive_size,
-        dry_run=dry_run,
-    )
     register_tar_replicas(
         archive_datasets=archive_datasets,
-        input_directories=input_directories,
         tar_paths=tar_paths,
         data_root=data_root,
         campaign_store=campaign_store,
@@ -394,9 +424,8 @@ def create_archives(
 
     print(
         f"\nCampaign archive creation complete: {archive_count} archive(s), "
-        f"{len(tar_paths)} TAR file(s), up to {archive_size} datasets per archive."
+        f"{len(tar_paths)} TAR file(s), one campaign archive per date."
     )
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(

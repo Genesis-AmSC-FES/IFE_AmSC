@@ -7,7 +7,7 @@
 #   - RHINO data locations
 #   - campaign storage locations
 #   - archive naming conventions
-#   - archive sizing parameters
+#   - date-based campaign grouping
 #   - input directories containing ADIOS/openPMD outputs
 #
 # These parameters are separated from the workflow logic so that:
@@ -29,8 +29,6 @@ CAMPAIGN_STORE="/global/homes/b/bhowmic/campaign-store/IFE"     #needs to be upd
 CAMPAIGN_NAMESPACE="IFE"
 
 ARCHIVE_PREFIX="rhino"
-
-DATASETS_PER_ARCHIVE=80
 
 CAMPAIGN_INDEX="rhino.acx"
 

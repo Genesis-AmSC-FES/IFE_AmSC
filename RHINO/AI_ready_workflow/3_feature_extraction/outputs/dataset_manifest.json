@@ -1,0 +1,24 @@
+{
+  "columns": [
+    "archive",
+    "datasetid",
+    "run_id",
+    "simulation_date",
+    "simulation_time",
+    "simulation_datetime",
+    "tritium_burning_rate",
+    "burn_fraction",
+    "plant_doubling_time_days",
+    "minimum_startup_inventory_g",
+    "tritium_in_isotope_separation"
+  ],
+  "created_utc": "2026-09-03T02:57:21+00:00",
+  "dataset_file": "/global/u1/b/bhowmic/Projects/IFE_AmSC/RHINO/AI_ready_workflow/3_feature_extraction/outputs/rhino_features.csv",
+  "dataset_name": "rhino-features",
+  "provenance": {
+    "manifest_kind": "backfilled-existing-export"
+  },
+  "rows": 2934,
+  "schema_version": 1,
+  "sha256": "bc59ba76f19569e928196843745f12dac153e0035ddb5d52ed95142213b60830"
+}

@@ -1,222 +1,351 @@
 # RHINO Campaign Management Layer
 
-This layer organizes the openPMD/ADIOS BP5 datasets produced by the shim layer
-into HPC Campaign archives and a searchable campaign index. Both Python and
-Bash entry points are provided. They perform the same two-stage workflow but
-use different configuration files.
+This layer organizes the openPMD/ADIOS BP5 datasets produced by the RHINO shim
+layer into date-based HPC Campaign archives and a searchable campaign index. It
+preserves the original datasets as live replicas, creates and records a portable
+TAR copy for each day, and builds a SQLite-backed `.acx` index over the generated
+`.aca` archives. The index provides one entry point for discovering archives and
+their datasets, inspecting campaign metadata, and selecting data for downstream
+queries, feature extraction, and analysis.
 
-## Workflow
+The Python entry point, `create_archives.py`, is the canonical implementation for the
+current NERSC workflow.
+
+## Artifact model
+
+A `.bp5` dataset is an ADIOS dataset directory containing the scientific data.
+A `.aca` file is a small HPC Campaign metadata archive: it identifies datasets,
+run IDs, and the storage replicas from which those datasets may be accessed. The
+scientific payload is not embedded in the `.aca` file.
+
+The workflow creates one campaign archive and one TAR for each configured date:
 
 ```text
-RHINO outputs from the shim layer (ADIOS BP5 directories)
+Input date directory              Campaign archive          Archival copy
+2026-04-29/*.bp5             ->   rhino-2026-04-29.aca  ->  rhino-2026-04-29.tar
+2026-04-30/*.bp5             ->   rhino-2026-04-30.aca  ->  rhino-2026-04-30.tar
+2026-05-01/*.bp5             ->   rhino-2026-05-01.aca  ->  rhino-2026-05-01.tar
+```
+
+The TAR is not produced by feeding the serialized `.aca` file to `tar`.
+Instead, the script first constructs the exact dataset list for the date-based
+ACA and then uses that same list as the TAR membership list. Consequently, the
+ACA and TAR describe the same set of BP5 datasets. Dataset paths inside the TAR
+remain relative to `RHINO_DATA_ROOT`, allowing `hpc_campaign taridx` to match
+TAR members to the dataset paths recorded in the ACA.
+
+## Archive workflow
+
+```text
+Discover top-level *.bp5 datasets in each configured date directory
     |
     v
-Uncompressed TAR files, checksums, and TAR indexes
+Create one date-based .aca and add its live BP5 dataset references
     |
     v
-Campaign archives with live and TAR-backed replicas (.aca)
+Create one uncompressed TAR from exactly that ACA's dataset list
     |
     v
-Campaign index (.acx)
+Write a SHA-256 checksum and create the TAR index
     |
     v
-SQL queries and feature extraction
+Register the NERSC TAR location in the corresponding .aca
+    |
+    v
+Publish completed .aca files to the shared project campaign store
+    |
+    v
+Build the searchable campaign index (.acx) from the published copies
 ```
 
-The archive stage packages each configured BP5 directory in an uncompressed
-TAR, verifies it with SHA-256, assigns each dataset a RHINO run ID, groups the
-runs into campaign archives, and registers the TAR copies as archived replicas.
-The index stage registers the completed campaign archives in a SQLite-backed
-`.acx` file for inspection and querying.
+For each date, `create_archives.py` performs these operations:
 
-## Requirements
+1. Loads and validates `campaign_spec.json`.
+2. Discovers top-level `*.bp5` datasets in the configured date directory.
+3. Creates `<ARCHIVE_PREFIX>-<date>.aca` and assigns each dataset its RHINO
+   run ID.
+4. Creates `<TAR_PREFIX>-<date>.tar` from exactly those datasets.
+5. Writes `<tar-name>.sha256` and `<tar-name>.idx`.
+6. Registers the TAR location with that ACA using
+   `hpc_campaign manager ... add-archival-storage`.
 
-- Python 3.10 or newer for the Python entry points and `hpc-campaign` 0.7
-- Bash for the shell entry points
-- `tar` and `sha256sum` for the Bash archive entry point
-- `hpc_campaign` available on `PATH`
-- RHINO BP5 datasets in the configured input directories
-- `sqlite3` to run the supplied SQL queries directly
+HPC Campaign records the location of a replica; it does not copy or upload the
+TAR. File transfer is a separate operational step.
 
-Run the examples below from this directory:
+## Current NERSC configuration
 
-```bash
-cd RHINO/AI_ready_workflow/2_campaign
+The current configuration records one TAR copy per ACA. That copy is stored on
+the NERSC project filesystem under:
+
+```text
+/global/cfs/cdirs/m3239/2026_FES-AmSC/data/rhino/
 ```
 
-## Python Workflow
-
-The Python workflow uses `campaign_spec.json`. Edit that file before running
-the scripts for a new campaign or filesystem location.
-
-### `campaign_spec.json`
-
-| Setting | Purpose |
-| --- | --- |
-| `RHINO_DATA_ROOT` | Root directory containing the RHINO BP5 output directories |
-| `CAMPAIGN_STORE` | HPC Campaign storage directory |
-| `CAMPAIGN_NAMESPACE` | Logical name retained across the Python and Bash campaign configurations |
-| `ARCHIVE_PREFIX` | Prefix for generated archives, such as `rhino` |
-| `DATASETS_PER_ARCHIVE` | Maximum number of BP5 datasets placed in each archive |
-| `CAMPAIGN_INDEX` | Index path; a relative path is resolved from `CAMPAIGN_STORE` |
-| `TAR_OUTPUT_DIR` | TAR storage directory; a relative path is resolved from `RHINO_DATA_ROOT` |
-| `TAR_PREFIX` | Prefix for date-based TAR names, such as `rhino` |
-| `TAR_STORAGE_SYSTEM` | HPC Campaign archival-storage type, such as `fs` |
-| `TAR_STORAGE_HOST` | Short, unique host name recorded for the TAR location |
-| `INPUT_DIRS` | Directories to scan under `RHINO_DATA_ROOT` |
-
-Only top-level `*.bp5` entries in each `INPUT_DIRS` directory are discovered;
-the search is not recursive.
-
-### `create_archives.py`
-
-`create_archives.py` performs the complete archive stage:
-
-1. Loads and validates the archive settings in the JSON specification.
-2. Discovers and sorts BP5 datasets to make archive grouping deterministic.
-3. Creates one uncompressed TAR per `INPUT_DIRS` entry, writes its `.sha256`
-   checksum, and creates its `.tar.idx` with `hpc_campaign taridx`.
-4. Derives the run ID from the timestamp-like portion of each dataset name,
-   falling back to the complete filename stem when no timestamp is present.
-5. Groups runs according to `DATASETS_PER_ARCHIVE`.
-6. Creates `ARCHIVE_PREFIX1.aca`, `ARCHIVE_PREFIX2.aca`, and so on, and adds
-   each dataset with its run ID as the campaign dataset name.
-7. Registers each relevant TAR and its index with each `.aca`. HPC Campaign
-   automatically creates archived replicas for matching BP5 member paths.
-
-Preview dataset discovery, grouping, and generated `hpc_campaign` commands
-without creating archives:
-
-```bash
-python create_archives.py --dry-run
-```
-
-Create the archives:
-
-```bash
-python create_archives.py
-```
-
-The first dataset in each group is added with `--truncate`, so an archive with
-the same generated name is replaced when that group is rebuilt. Existing TARs
-are reused only after their SHA-256 checksums pass. To deliberately replace the
-TARs, checksums, and TAR indexes, run:
-
-```bash
-python create_archives.py --rebuild-tars
-```
-
-### `create_index.py`
-
-`create_index.py` performs the index stage:
-
-1. Loads and validates the index settings in the JSON specification.
-2. Finds and sorts archives matching `ARCHIVE_PREFIX*.aca` directly inside
-   `CAMPAIGN_STORE`.
-3. Replaces the configured campaign index.
-4. Registers all discovered archives with `hpc_campaign index ... add`.
-5. Runs `hpc_campaign index ... ls` to inspect the resulting index.
-
-Preview the index location, discovered archives, and generated commands without
-deleting or creating an index:
-
-```bash
-python create_index.py --dry-run
-```
-
-Build the index after the archives have been created:
-
-```bash
-python create_index.py
-```
-
-Both Python scripts accept a different JSON specification:
-
-```bash
-python create_archives.py --spec /path/to/campaign_spec.json
-python create_index.py --spec /path/to/campaign_spec.json
-```
-
-The scripts stop immediately if configuration validation or an
-`hpc_campaign` command fails.
-
-## Bash Workflow
-
-The original Bash workflow remains available. It reads the equivalent settings
-from `config_campaign.sh` rather than from `campaign_spec.json`.
-
-### `config_campaign.sh`
-
-Edit `config_campaign.sh` to set the RHINO data root, campaign store,
-namespace, archive prefix, archive size, index path, BP5 input directories, and
-TAR storage settings.
-
-### `create_archives.sh`
-
-`create_archives.sh` discovers the configured BP5 datasets, sorts them, derives
-their run IDs, creates or verifies the TAR/checksum/index products, divides the
-datasets into archive groups, creates each `.aca`, and registers the relevant
-TAR-backed replicas.
-
-Run it with:
-
-```bash
-bash create_archives.sh
-```
-
-The Bash entry point supports the same controls as the Python entry point:
-
-```bash
-bash create_archives.sh --dry-run
-bash create_archives.sh --rebuild-tars
-```
-
-### `create_index.sh`
-
-`create_index.sh` finds archives matching the configured prefix, removes the
-existing index, registers the archives in a new index, and lists the index
-contents.
-
-Run it after archive creation:
-
-```bash
-bash create_index.sh
-```
-
-Review `config_campaign.sh` before running the Bash workflow. Use either the
-Python workflow or the Bash workflow for a given archive/index build; running
-both will recreate the same configured outputs.
-
-## Outputs
-
-With an `ARCHIVE_PREFIX` of `rhino`, archive creation produces files such as:
+The generated products have names such as:
 
 ```text
 rhino-2026-04-29.tar
 rhino-2026-04-29.tar.sha256
 rhino-2026-04-29.tar.idx
-rhino1.aca
-rhino2.aca
-rhino3.aca
 ```
 
-Index creation produces the `.acx` file configured by `CAMPAIGN_INDEX`. The
-index contains queryable RHINO run metadata and attributes and can be inspected
-with `hpc_campaign index` or queried directly with `sqlite3`.
+The campaign store containing the ACA metadata is configured as:
 
-## SQL Queries
+```text
+/global/homes/b/bhowmic/campaign-store/IFE/
+```
 
-The `queries/` directory contains reusable queries for campaign inspection,
-metadata discovery, scientific analysis, feature extraction, and surrogate
-model dataset generation. These queries are used by the feature extraction layer
-to compute the features needed for training the surrogate. They include both
-reading metadata directly from `.aca` files and reading data from remote
-locations.
+It contains date-based archives such as:
 
-For the default index located at `<CAMPAIGN_STORE>/rhino.acx`, run a query with:
+```text
+rhino-2026-04-29.aca
+rhino-2026-04-30.aca
+rhino-2026-05-01.aca
+```
+
+The ACA files are first created in the private working store. The publication
+stage copies completed ACA files to the shared project store:
+
+```text
+/global/cfs/cdirs/m3239/2026_FES-AmSC/campaigns/IFE/
+```
+
+The authoritative `.acx` index is built in this shared directory after
+publication. The current archive stage still records only the NERSC TAR copy; a
+second facility TAR replica remains part of the later facility handoff.
+
+## Requirements
+
+- Python 3.10 or newer
+- `hpc-campaign` 0.7 with `hpc_campaign` available on `PATH`
+- `tar` and `rsync`
+- RHINO BP5 datasets in the configured input directories
+- `sqlite3` for running the supplied SQL queries directly
+
+Run commands from this directory:
 
 ```bash
-sqlite3 /path/to/campaign-store/IFE/rhino.acx < queries/list_archives.sql
+cd RHINO/AI_ready_workflow/2_campaign
 ```
 
-See `queries/README.md` for the available queries and their expected outputs.
+## Configuration
+
+The Python workflow reads `campaign_spec.json`.
+
+| Setting | Purpose |
+| --- | --- |
+| `RHINO_DATA_ROOT` | Root directory used to resolve and record BP5 dataset paths |
+| `CAMPAIGN_STORE` | Private working directory containing generated ACA files |
+| `PUBLISH_CAMPAIGN_STORE` | Shared project directory receiving completed ACA files and the authoritative index |
+| `CAMPAIGN_NAMESPACE` | Logical campaign name shared by the archive and index configuration |
+| `ARCHIVE_PREFIX` | Prefix for date-based ACA names, such as `rhino` |
+| `CAMPAIGN_INDEX` | Index path; a relative path is resolved from `PUBLISH_CAMPAIGN_STORE` |
+| `TAR_OUTPUT_DIR` | Directory in which TAR products are created |
+| `TAR_PREFIX` | Prefix for date-based TAR names, such as `rhino` |
+| `TAR_STORAGE_SYSTEM` | HPC Campaign storage type, currently `fs` |
+| `TAR_STORAGE_HOST` | Host label recorded for the TAR replica, currently `NERSC` |
+| `INPUT_DIRS` | Date directories to scan under `RHINO_DATA_ROOT` |
+
+Each `INPUT_DIRS` entry must be relative to `RHINO_DATA_ROOT`. Only
+top-level `*.bp5` entries are discovered; the search is not recursive.
+
+## Running archive creation
+
+Preview discovery, date grouping, and generated commands without modifying
+files:
+
+```bash
+python create_archives.py --dry-run
+```
+
+Create the ACAs, TAR products, and NERSC replica registrations:
+
+```bash
+python create_archives.py
+```
+
+The first dataset added to each ACA uses `--truncate`; therefore, an existing ACA
+with the same date-based name is replaced during a real archive build.
+
+Existing TARs are reused only if their SHA-256 checksum succeeds and their
+members match the associated ACA dataset list. If an older TAR contains the
+whole date directory or otherwise differs from the ACA, the script stops and
+requests an explicit rebuild:
+
+```bash
+python create_archives.py --rebuild-tars
+```
+
+This option replaces the TAR, checksum, and TAR index. Use it deliberately
+because rebuilding a large daily TAR may be expensive.
+
+A different specification may be supplied with:
+
+```bash
+python create_archives.py --spec /path/to/campaign_spec.json
+```
+
+## Publishing campaign archives
+
+`publish_campaign.py` is the required stage between archive creation and index
+creation. It finds completed `<ARCHIVE_PREFIX>-*.aca` files in
+`CAMPAIGN_STORE` and copies only those ACA files to
+`PUBLISH_CAMPAIGN_STORE` with `rsync -a --checksum`. It does not copy a
+personal `.acx` index or delete older published archives.
+
+Preview the source archives, destination, and rsync command without changing
+files:
+
+```bash
+python publish_campaign.py --dry-run
+```
+
+Publish the completed ACA files:
+
+```bash
+python publish_campaign.py
+```
+
+After rsync completes, the script calculates SHA-256 digests of the source and
+published ACA files and stops if any copy is missing or differs. Index creation
+must run only after this stage succeeds.
+
+The complete Python workflow order is:
+
+```bash
+python create_archives.py
+python publish_campaign.py
+python create_index.py
+```
+
+## Using the workflow at the RHINO facility
+
+The same organization can manage new data where it is generated. At the
+facility, scientists should configure:
+
+- `RHINO_DATA_ROOT` for the facility's RHINO output root.
+- `INPUT_DIRS` for the completed date directories.
+- `CAMPAIGN_STORE` for the facility's ACA metadata store.
+- `TAR_OUTPUT_DIR` for durable facility archive storage.
+- `TAR_STORAGE_HOST` with a short, stable facility host or site label.
+
+Running the workflow there will create one ACA and one local TAR per date and
+register the facility TAR as the first archival replica. The facility can keep
+this TAR as its retained copy.
+
+To maintain a second copy at NERSC, the operational handoff is:
+
+1. Transfer the TAR, `.sha256`, and `.idx` files to the designated NERSC
+   project-data directory using the facility's approved transfer mechanism,
+   such as Globus.
+2. Verify the transferred TAR against its SHA-256 checksum at NERSC.
+3. Register the verified NERSC TAR location in the same ACA as an additional
+   archival-storage replica.
+4. Publish or copy the final updated ACA to the location from which the
+   campaign index will be built.
+
+One ACA can describe both physical copies; a second ACA is not required. The
+facility and NERSC copies should use the same TAR filename and content so the
+same TAR index describes both. A NERSC location must not be registered before
+the upload and checksum verification succeed, because registration records a
+location but does not prove that the file exists there.
+
+The current script automates the single local/NERSC registration used during
+development. Automating the facility-to-NERSC transfer and adding the second
+replica are handoff extensions and are intentionally not performed by the
+current NERSC run.
+
+## Campaign index
+
+After publication, `create_index.py` builds the authoritative searchable
+`.acx` index directly in `PUBLISH_CAMPAIGN_STORE`:
+
+```bash
+python create_index.py --dry-run
+python create_index.py
+```
+
+It discovers archives matching `ARCHIVE_PREFIX*.aca` in the published store,
+recreates `CAMPAIGN_INDEX` there, registers the published ACA paths, and lists
+the resulting index. If ACA files are republished later, rebuild the index.
+
+## Bash entry points
+
+Shell entry points remain available for compatibility and read
+`config_campaign.sh`:
+
+```bash
+bash create_archives.sh --dry-run
+bash create_archives.sh
+bash create_archives.sh --rebuild-tars
+bash create_index.sh
+```
+
+Use either the Python or Bash archive entry point for a given build. The Python
+entry point documents and enforces the current ACA-driven TAR membership and is
+recommended for the NERSC workflow.
+
+## SQL queries
+
+The `queries/` directory contains reusable SQL for campaign inspection,
+metadata discovery, scientific analysis, feature extraction, and surrogate
+model dataset generation. For an index at
+`<PUBLISH_CAMPAIGN_STORE>/rhino.acx`, a query can be run with:
+
+```bash
+sqlite3 /global/cfs/cdirs/m3239/2026_FES-AmSC/campaigns/IFE/rhino.acx < queries/list_archives.sql
+```
+
+See `queries/README.md` for available queries and their expected outputs.
+
+
+## Model-training campaign
+
+The trained model itself remains in MLflow; it is not copied into an ACA. After
+`uploadRunToMlflow.py` successfully logs the model (and, unless disabled,
+creates a registry version), it writes one immutable JSON provenance record to
+`ML/surrogate_training/artifacts/mlflow_registry/<mlflow-run-id>.json`.
+
+Each record contains:
+
+- the clickable MLflow run URL;
+- the MLflow model URI, registered-model name, and version;
+- evaluation metrics;
+- the original training manifest, including dataset and feature hashes,
+  train/validation/test sizes, hyperparameters, source Git state, runtime, and
+  artifact checksums.
+
+`create_model_campaign.py` validates every completed record and rebuilds the
+separate `rhino-model-training.aca`. Each ACA dataset is named
+`mlflow-run-<run-id>` and points to its JSON provenance record. Rebuilding from
+all records keeps the result deterministic and avoids duplicate ACA entries.
+
+Preview the operation first:
+
+```bash
+python create_model_campaign.py --dry-run
+```
+
+After at least one MLflow upload has produced a record, create the ACA:
+
+```bash
+python create_model_campaign.py
+```
+
+Then run the normal publication sequence:
+
+```bash
+python publish_campaign.py --dry-run
+python publish_campaign.py
+python create_index.py
+```
+
+The existing publication glob includes `rhino-model-training.aca`, so it is
+copied to the shared NERSC project campaign store with the date-based data ACAs.
+The index also includes it, allowing the data archives and model-training
+provenance to be discovered through the same `rhino.acx` index while remaining
+separate ACA files.
+
+The related settings in `campaign_spec.json` are
+`MODEL_CAMPAIGN_ARCHIVE`, `MODEL_PROVENANCE_ROOT`, and
+`MODEL_RUN_RECORD_DIR`.
