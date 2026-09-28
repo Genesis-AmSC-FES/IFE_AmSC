@@ -17,6 +17,7 @@ import torch
 
 from dataset_tracking import log_mlflow_dataset_inputs, sha256_file
 from mlflow_model import RhinoSurrogatePyFunc
+from mlflow_registry import write_run_record
 from trainSurrogate import BASE_DIR, SurrogateMLP
 
 
@@ -262,8 +263,9 @@ def main() -> None:
             )
 
         metrics_path = run_dir / "metrics.json"
-        if metrics_path.is_file():
-            mlflow.log_metrics(flatten_test_metrics(load_json(metrics_path)))
+        metrics = load_json(metrics_path) if metrics_path.is_file() else {}
+        if metrics:
+            mlflow.log_metrics(flatten_test_metrics(metrics))
             mlflow.set_tag("evaluation_complete", "true")
 
         torch_version = str(torch.__version__).split("+", maxsplit=1)[0]
@@ -290,13 +292,33 @@ def main() -> None:
                 "features_sha256": dataset["features_sha256"],
             },
         )
+        tracking_public = public_tracking_uri(tracking_uri)
+        campaign_record = write_run_record(
+            run_dir.parent / "mlflow_registry",
+            run_id=run.info.run_id,
+            run_name=args.run_name or str(default_run_name),
+            experiment_id=run.info.experiment_id,
+            experiment_name=args.experiment,
+            tracking_uri=tracking_public,
+            model_uri=model_info.model_uri,
+            registered_model_name=registered_name,
+            registered_model_version=model_info.registered_model_version,
+            run_manifest=manifest,
+            metrics=metrics,
+            run_bundle=run_dir,
+        )
         receipt = {
-            "tracking_uri": public_tracking_uri(tracking_uri),
+            "tracking_uri": tracking_public,
             "experiment": args.experiment,
             "run_id": run.info.run_id,
+            "mlflow_run_url": (
+                f"{tracking_public.rstrip('/')}/#/experiments/"
+                f"{run.info.experiment_id}/runs/{run.info.run_id}"
+            ),
             "model_uri": model_info.model_uri,
             "registered_model_name": registered_name,
             "registered_model_version": model_info.registered_model_version,
+            "campaign_record": str(campaign_record),
         }
         receipt_path = run_dir / f"mlflow_upload_{run.info.run_id}.json"
         with receipt_path.open("w", encoding="utf-8") as stream:

@@ -489,3 +489,19 @@ each epoch on unseen validation data and the checkpoint with lowest validation
 loss is retained. Test metrics are computed once after model selection on the
 separate held-out samples, making them the final unbiased estimate. Validation
 loss is therefore not the same as test loss.
+
+
+## Campaign record after MLflow upload
+
+A successful `uploadRunToMlflow.py` invocation now writes a second, durable
+receipt under `artifacts/mlflow_registry/<mlflow-run-id>.json`. This record is
+created only after the serving model has been logged to MLflow. It contains the
+MLflow run URL, model URI, optional registry name/version, metrics, and the full
+`run_manifest.json` provenance from the training bundle. Tracking credentials and
+URL query parameters are not stored.
+
+The model stays in MLflow. The JSON receipt is the small catalogable object used
+by `AI_ready_workflow/2_campaign/create_model_campaign.py` to build the separate
+`rhino-model-training.aca`. Re-running an upload for the same MLflow run ID
+atomically replaces that run's receipt; rebuilding the ACA reads all completed
+receipts.
