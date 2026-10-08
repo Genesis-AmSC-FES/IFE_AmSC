@@ -191,3 +191,4 @@ The workflow produces several kinds of data and model artifacts:
 
 Raw simulation data and large generated artifacts should generally be stored in
 the appropriate project data location rather than committed to Git.
+

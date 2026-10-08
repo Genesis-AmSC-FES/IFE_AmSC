@@ -1,0 +1,8 @@
+{
+  "LASER_DATA_ROOT": "/global/cfs/cdirs/m3239/2026_FES-AmSC/data/laser",
+  "CAMPAIGN_STORE": "/global/homes/b/bhowmic/campaign-store/IFE",
+  "PUBLISH_CAMPAIGN_STORE": "/global/cfs/cdirs/m3239/2026_FES-AmSC/campaigns/IFE",
+  "CAMPAIGN_NAMESPACE": "IFE",
+  "ARCHIVE_PREFIX": "laser",
+  "CAMPAIGN_INDEX": "laser.acx"
+}
